@@ -16,7 +16,7 @@ datasets such as DOCDB, INPADOC, and EP full-text.
 - **File downloads** - stream a delivery file to any `io.Writer`, with an
   optional progress callback for large files.
 - **Automatic auth** - OAuth2 password grant; tokens are cached and refreshed
-  before expiry. Credentials are optional: free/public products work without them.
+  before expiry. Every endpoint requires an EPO account.
 - **Robust requests** - retry with backoff and automatic re-authentication on
   expiry; typed errors for the common failure cases.
 
@@ -28,9 +28,10 @@ go get github.com/patent-dev/epo-bdds
 
 ## Getting access
 
-Free/public BDDS products can be listed and downloaded without an account. Paid
-products require an EPO account with a subscription to the relevant product; the
-client then authenticates via OAuth2 password grant.
+Every BDDS request needs an EPO account, including the product list and free
+products; paid products also need a subscription to the product. The client
+authenticates via OAuth2 password grant. Without credentials, requests fail with
+an `*AuthError` (BDDS redirects them to the interactive EPO login).
 
 1. Open the [BDDS portal](https://publication-bdds.apps.epo.org) to browse the
    product catalogue, then start sign-in / registration.
@@ -38,7 +39,8 @@ client then authenticates via OAuth2 password grant.
 2. Sign in with your EPO account, or create one at the
    [EPO login](https://login.epo.org).
 
-3. Subscribe to the products you need (free/public products need no subscription).
+3. Subscribe to the products you need (free products need no subscription, but
+   still need the account).
 
 4. Export your EPO credentials for the client and demo:
    ```bash
@@ -56,14 +58,17 @@ import (
     "context"
     "fmt"
     "log"
+    "os"
 
     bdds "github.com/patent-dev/epo-bdds"
 )
 
 func main() {
-    // Credentials are optional: free/public products (including ListProducts)
-    // work without them. Pass a Config with Username/Password for paid products.
-    client, err := bdds.NewClient(nil)
+    // Every BDDS endpoint requires an EPO account.
+    client, err := bdds.NewClient(&bdds.Config{
+        Username: os.Getenv("EPO_BDDS_USERNAME"),
+        Password: os.Getenv("EPO_BDDS_PASSWORD"),
+    })
     if err != nil {
         log.Fatal(err)
     }
@@ -86,8 +91,8 @@ func main() {
 
 ```go
 config := &bdds.Config{
-    Username:   "your-username",                          // optional, needed for paid products
-    Password:   "your-password",                          // optional, needed for paid products
+    Username:   "your-username",                          // required: EPO account
+    Password:   "your-password",                          // required
     BaseURL:    "https://publication-bdds.apps.epo.org",  // default
     UserAgent:  "YourApp/1.0",                            // optional
     MaxRetries: 3,                                        // default: 3
@@ -126,8 +131,7 @@ for _, d := range product.Deliveries {
 
 ### File downloads
 
-If you already have the product, delivery, and file IDs, downloads work without
-credentials:
+With the product, delivery, and file IDs, a file streams to any `io.Writer`:
 
 ```go
 f, err := os.Create("download.zip")

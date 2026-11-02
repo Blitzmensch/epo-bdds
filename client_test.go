@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -32,7 +33,9 @@ func TestDefaultConfig(t *testing.T) {
 	}
 }
 
-// TestNewClient_WithoutCredentials tests that NewClient works without credentials
+// TestNewClient_WithoutCredentials tests that a client can be built without
+// credentials; requests then fail with an AuthError (see
+// TestWithoutCredentialsLoginRedirectIsAuthError).
 func TestNewClient_WithoutCredentials(t *testing.T) {
 	config := &Config{}
 	client, err := NewClient(config)
@@ -42,7 +45,35 @@ func TestNewClient_WithoutCredentials(t *testing.T) {
 	if client == nil {
 		t.Error("Expected client to be created")
 	}
-	// Client should work for downloads even without credentials
+}
+
+// TestWithoutCredentialsLoginRedirectIsAuthError replays the response BDDS
+// gives an unauthenticated request (captured 2026-11-02): a 302 to the EPO
+// login. The client must report missing credentials instead of following the
+// redirect and failing to decode the login page.
+func TestWithoutCredentialsLoginRedirectIsAuthError(t *testing.T) {
+	const location = "https://login.epo.org/oauth2/aus3up3nz0N133c0V417/v1/authorize?client_id=0oa3up94e542v9XIX417&redirect_uri=https%3A%2F%2Fpublication-bdds.apps.epo.org%2Foauth-cb-dmz%2Foauth2%2Fcallback&response_type=code&scope=offline_access%20openid"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "" {
+			t.Errorf("unexpected Authorization header without credentials")
+		}
+		w.Header().Set("Location", location)
+		w.WriteHeader(http.StatusFound)
+	}))
+	defer server.Close()
+
+	client, err := NewClient(&Config{BaseURL: server.URL, MaxRetries: 3, RetryDelay: time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.ListProducts(context.Background())
+	var authErr *AuthError
+	if !errors.As(err, &authErr) {
+		t.Fatalf("ListProducts error = %v, want *AuthError", err)
+	}
+	if authErr.StatusCode != http.StatusFound {
+		t.Errorf("StatusCode = %d, want 302", authErr.StatusCode)
+	}
 }
 
 // TestClientWithMockServer tests all client methods with mock server

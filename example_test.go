@@ -7,8 +7,8 @@ import (
 )
 
 func ExampleNewClient() {
-	// Credentials are optional: free/public products work without them,
-	// paid products require an EPO BDDS subscription.
+	// Every BDDS endpoint requires an EPO account; paid products also need
+	// a subscription to that product.
 	client, err := bdds.NewClient(&bdds.Config{
 		Username: "your-epo-username",
 		Password: "your-epo-password",

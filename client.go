@@ -64,9 +64,9 @@ func DefaultConfig() *Config {
 	}
 }
 
-// NewClient creates a new EPO BDDS API client
-// Authentication is optional - free products work without credentials,
-// paid products require EPO BDDS subscription and authentication.
+// NewClient creates a new EPO BDDS API client.
+// Every BDDS endpoint requires an EPO account, including the product list and
+// free products; without credentials requests fail with an *AuthError.
 func NewClient(config *Config) (*Client, error) {
 	// Copy the caller's config so applying defaults never mutates their struct.
 	cfg := DefaultConfig()
@@ -94,7 +94,8 @@ func NewClient(config *Config) (*Client, error) {
 	config = cfg
 
 	httpClient := &http.Client{
-		Timeout: config.Timeout,
+		Timeout:       config.Timeout,
+		CheckRedirect: refuseLoginRedirect,
 	}
 
 	client := &Client{
@@ -114,6 +115,26 @@ func NewClient(config *Config) (*Client, error) {
 	client.generatedClient = genClient
 
 	return client, nil
+}
+
+// loginHost is where BDDS sends unauthenticated requests.
+const loginHost = "login.epo.org"
+
+// refuseLoginRedirect stops BDDS from redirecting an unauthenticated request
+// to the interactive EPO login page, which would otherwise be fetched and fail
+// to decode. Other redirects (for example to file storage) are followed.
+func refuseLoginRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= 10 {
+		return errors.New("stopped after 10 redirects")
+	}
+	if req.URL.Host == loginHost {
+		status := http.StatusFound
+		if req.Response != nil {
+			status = req.Response.StatusCode
+		}
+		return &AuthError{StatusCode: status, Message: "EPO BDDS requires credentials: the request was redirected to the EPO login"}
+	}
+	return nil
 }
 
 // authRequestEditor adds authentication and user agent to requests

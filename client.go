@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -34,6 +35,7 @@ const (
 // Client is the main EPO BDDS API client
 type Client struct {
 	config          *Config
+	apiHost         string // host of BaseURL
 	httpClient      *http.Client
 	generatedClient *generated.ClientWithResponses
 
@@ -98,8 +100,14 @@ func NewClient(config *Config) (*Client, error) {
 		CheckRedirect: refuseLoginRedirect,
 	}
 
+	base, err := url.Parse(config.BaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid base URL: %w", err)
+	}
+
 	client := &Client{
 		config:     config,
+		apiHost:    base.Host,
 		httpClient: httpClient,
 	}
 
@@ -120,14 +128,24 @@ func NewClient(config *Config) (*Client, error) {
 // loginHost is where BDDS sends unauthenticated requests.
 const loginHost = "login.epo.org"
 
+// isLoginURL reports whether u belongs to an interactive OAuth login: the EPO
+// login host (any case, port or trailing dot) or an OAuth2 path on any host.
+func isLoginURL(u *url.URL) bool {
+	host := strings.TrimSuffix(u.Hostname(), ".")
+	return strings.EqualFold(host, loginHost) || strings.Contains(u.Path, "/oauth2/")
+}
+
 // refuseLoginRedirect stops BDDS from redirecting an unauthenticated request
 // to the interactive EPO login page, which would otherwise be fetched and fail
 // to decode. Other redirects (for example to file storage) are followed.
 func refuseLoginRedirect(req *http.Request, via []*http.Request) error {
 	if len(via) >= 10 {
-		return errors.New("stopped after 10 redirects")
+		// A redirect loop does not resolve itself on retry.
+		return &nonRetryableError{err: errors.New("stopped after 10 redirects")}
 	}
-	if req.URL.Host == loginHost {
+	// The token request starts on the login host itself; only a redirect
+	// from the API into a login flow means the credentials are missing.
+	if isLoginURL(req.URL) && !isLoginURL(via[0].URL) {
 		status := http.StatusFound
 		if req.Response != nil {
 			status = req.Response.StatusCode
@@ -137,9 +155,26 @@ func refuseLoginRedirect(req *http.Request, via []*http.Request) error {
 	return nil
 }
 
+// checkForeignHTML fails a download whose redirects ended on another host
+// with an HTML page instead of the file.
+func checkForeignHTML(apiHost string, resp *http.Response) error {
+	if resp.Request == nil || strings.EqualFold(resp.Request.URL.Host, apiHost) {
+		return nil
+	}
+	mt, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	if mt != "text/html" {
+		return nil
+	}
+	if isLoginURL(resp.Request.URL) {
+		return &AuthError{StatusCode: resp.StatusCode, Message: "EPO BDDS requires credentials: the download was redirected to a login page"}
+	}
+	return &nonRetryableError{err: fmt.Errorf("download was redirected to %s and returned an HTML page instead of the file", resp.Request.URL.Host)}
+}
+
 // authRequestEditor adds authentication and user agent to requests
 func (c *Client) authRequestEditor(ctx context.Context, req *http.Request) error {
-	// Skip authentication if no credentials provided
+	// Without credentials the request goes out unauthenticated; BDDS answers
+	// with a login redirect, which refuseLoginRedirect reports as *AuthError.
 	if c.config.Username != "" && c.config.Password != "" {
 		// Ensure we have a valid token
 		token, err := c.ensureValidToken(ctx)
@@ -245,7 +280,9 @@ func (c *Client) authenticateLocked(ctx context.Context) error {
 func (c *Client) retryableRequest(ctx context.Context, fn func() error) error {
 	var lastErr error
 	reauthed := false
+	attempts := 0
 	for attempt := 0; attempt <= c.config.MaxRetries; attempt++ {
+		attempts++
 		err := fn()
 		if err == nil {
 			return nil
@@ -282,7 +319,7 @@ func (c *Client) retryableRequest(ctx context.Context, fn func() error) error {
 		case <-timer.C:
 		}
 	}
-	return fmt.Errorf("failed after %d retries: %w", c.config.MaxRetries, lastErr)
+	return fmt.Errorf("failed after %d attempt(s): %w", attempts, lastErr)
 }
 
 // classifyRetry reports whether err is transient and should be retried, plus an
@@ -466,6 +503,12 @@ func (c *Client) DownloadFileWithProgress(ctx context.Context, productID, delive
 		if resp.StatusCode != http.StatusOK {
 			body, _ := io.ReadAll(resp.Body)
 			return statusToError(resp.StatusCode, resp.Header, body)
+		}
+
+		// A redirect away from BDDS that ends in an HTML page (a login or
+		// error page on another host) must not be saved as the file.
+		if err := checkForeignHTML(c.apiHost, resp); err != nil {
+			return err
 		}
 
 		// A previous attempt already wrote bytes; rewind the destination so

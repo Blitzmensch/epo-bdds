@@ -5,10 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -47,32 +50,117 @@ func TestNewClient_WithoutCredentials(t *testing.T) {
 	}
 }
 
-// TestWithoutCredentialsLoginRedirectIsAuthError replays the response BDDS
-// gives an unauthenticated request (captured 2026-11-02): a 302 to the EPO
-// login. The client must report missing credentials instead of following the
-// redirect and failing to decode the login page.
-func TestWithoutCredentialsLoginRedirectIsAuthError(t *testing.T) {
-	const location = "https://login.epo.org/oauth2/aus3up3nz0N133c0V417/v1/authorize?client_id=0oa3up94e542v9XIX417&redirect_uri=https%3A%2F%2Fpublication-bdds.apps.epo.org%2Foauth-cb-dmz%2Foauth2%2Fcallback&response_type=code&scope=offline_access%20openid"
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Authorization") != "" {
-			t.Errorf("unexpected Authorization header without credentials")
-		}
-		w.Header().Set("Location", location)
-		w.WriteHeader(http.StatusFound)
-	}))
-	defer server.Close()
+// offlineTransport sends requests only to the test server's host and fails
+// every other host, so a broken redirect guard can never reach the network.
+type offlineTransport struct {
+	host string
+	hits atomic.Int32
+}
 
+func (o *offlineTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	if r.URL.Host != o.host {
+		return nil, fmt.Errorf("offline test: refused request to %s", r.URL.Host)
+	}
+	o.hits.Add(1)
+	return http.DefaultTransport.RoundTrip(r)
+}
+
+// offlineClient builds a client for server whose transport cannot leave it.
+func offlineClient(t *testing.T, server *httptest.Server) (*Client, *offlineTransport) {
+	t.Helper()
 	client, err := NewClient(&Config{BaseURL: server.URL, MaxRetries: 3, RetryDelay: time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = client.ListProducts(context.Background())
-	var authErr *AuthError
-	if !errors.As(err, &authErr) {
-		t.Fatalf("ListProducts error = %v, want *AuthError", err)
+	u, _ := url.Parse(server.URL)
+	tr := &offlineTransport{host: u.Host}
+	client.httpClient.Transport = tr
+	return client, tr
+}
+
+// capturedLoginLocation is the Location BDDS sends unauthenticated requests
+// to (captured 2026-11-02, PKCE challenge and state removed).
+const capturedLoginLocation = "https://login.epo.org/oauth2/aus3up3nz0N133c0V417/v1/authorize?client_id=0oa3up94e542v9XIX417&redirect_uri=https%3A%2F%2Fpublication-bdds.apps.epo.org%2Foauth-cb-dmz%2Foauth2%2Fcallback&response_type=code&scope=offline_access%20openid"
+
+// TestWithoutCredentialsLoginRedirectIsAuthError replays the response BDDS
+// gives an unauthenticated request: a 302 to the EPO login. The client must
+// report missing credentials after a single request instead of following the
+// redirect, retrying, or failing to decode the login page. Host spelling
+// variants of the login host must be recognised too.
+func TestWithoutCredentialsLoginRedirectIsAuthError(t *testing.T) {
+	for _, location := range []string{
+		capturedLoginLocation,
+		strings.Replace(capturedLoginLocation, "login.epo.org", "LOGIN.EPO.ORG", 1),
+		strings.Replace(capturedLoginLocation, "login.epo.org", "login.epo.org:443", 1),
+		strings.Replace(capturedLoginLocation, "login.epo.org", "login.epo.org.", 1),
+	} {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Header.Get("Authorization") != "" {
+				t.Errorf("unexpected Authorization header without credentials")
+			}
+			w.Header().Set("Location", location)
+			w.WriteHeader(http.StatusFound)
+		}))
+		client, tr := offlineClient(t, server)
+
+		_, err := client.ListProducts(context.Background())
+		server.Close()
+		var authErr *AuthError
+		if !errors.As(err, &authErr) {
+			t.Fatalf("%s: ListProducts error = %v, want *AuthError", location, err)
+		}
+		if authErr.StatusCode != http.StatusFound {
+			t.Errorf("%s: StatusCode = %d, want 302", location, authErr.StatusCode)
+		}
+		if n := tr.hits.Load(); n != 1 {
+			t.Errorf("%s: %d requests, want 1 (an auth failure is not retried)", location, n)
+		}
 	}
-	if authErr.StatusCode != http.StatusFound {
-		t.Errorf("StatusCode = %d, want 302", authErr.StatusCode)
+}
+
+// TestRedirectLoopIsNotRetried verifies a redirect loop fails after one
+// attempt instead of being retried as a network error.
+func TestRedirectLoopIsNotRetried(t *testing.T) {
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, server.URL+r.URL.Path, http.StatusFound)
+	}))
+	defer server.Close()
+	client, tr := offlineClient(t, server)
+
+	_, err := client.ListProducts(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "stopped after 10 redirects") {
+		t.Fatalf("error = %v, want redirect limit", err)
+	}
+	if n := tr.hits.Load(); n != 10 {
+		t.Errorf("%d requests, want 10 (one attempt; the 10th redirect is refused)", n)
+	}
+}
+
+// TestDownloadRejectsForeignHTML verifies a download that is redirected to
+// another host and ends in an HTML page is not written to dst as the file.
+func TestDownloadRejectsForeignHTML(t *testing.T) {
+	foreign := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = io.WriteString(w, "<html>sign in</html>")
+	}))
+	defer foreign.Close()
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, foreign.URL+"/landing", http.StatusFound)
+	}))
+	defer api.Close()
+
+	client, err := NewClient(&Config{BaseURL: api.URL, MaxRetries: 3, RetryDelay: time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var dst bytes.Buffer
+	err = client.DownloadFile(context.Background(), 3, 1, 1, &dst)
+	if err == nil {
+		t.Fatal("an HTML page from another host must not be accepted as the file")
+	}
+	if dst.Len() != 0 {
+		t.Errorf("wrote %d bytes of the HTML page to dst", dst.Len())
 	}
 }
 

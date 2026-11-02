@@ -5,6 +5,7 @@ package bdds_test
 import (
 	"context"
 	"errors"
+	"net/http"
 	"os"
 	"sort"
 	"strconv"
@@ -73,6 +74,11 @@ func skipExpected(t *testing.T, err error) {
 	}
 	var authErr *bdds.AuthError
 	if errors.As(err, &authErr) {
+		// With credentials set, a login redirect means the client stopped
+		// sending its token: a client bug, not a provisioning gap.
+		if authErr.StatusCode != http.StatusUnauthorized && authErr.StatusCode != http.StatusForbidden {
+			t.Fatalf("request was sent unauthenticated (status %d): %v", authErr.StatusCode, err)
+		}
 		t.Skipf("auth/forbidden (status %d): account not provisioned for this resource", authErr.StatusCode)
 	}
 	var notFound *bdds.NotFoundError

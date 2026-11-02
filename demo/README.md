@@ -4,9 +4,9 @@ Interactive demo application showcasing all features of the EPO BDDS Go client l
 
 ## Prerequisites
 
-This demo showcases both authenticated and unauthenticated features. Credentials are optional:
+The demo needs an EPO account: every BDDS request, including the product list and free products, requires credentials.
 - **Information**: https://www.epo.org/en/searching-for-patents/data/bulk-data-sets
-- **Note**: Free products work without credentials; paid products require EPO BDDS subscription
+- **Note**: paid products additionally require an EPO BDDS subscription to that product
 
 ## Running the Demo
 
@@ -27,7 +27,7 @@ go run demo.go
 ## Features Demonstrated
 
 ### 1. List All Products
-Browse all available BDDS products (both subscribed and public).
+Browse all BDDS products visible to your account (subscribed and free).
 
 ### 2. Get Product Details
 View detailed information about a specific product including:

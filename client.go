@@ -20,7 +20,7 @@ import (
 )
 
 // Version is the library version. It surfaces through the default User-Agent.
-const Version = "0.2.2"
+const Version = "0.2.4"
 
 // DefaultUserAgent identifies this library in outbound requests.
 const DefaultUserAgent = "epo-bdds-go/" + Version + " (patent.dev; +https://github.com/patent-dev/epo-bdds)"
